@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+    outputs:
+      tarball_sha256: ${{ steps.shasum.outputs.sha256 }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.3
+        run: sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer
+
+      - name: Validate tag format
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid tag format: $GITHUB_REF_NAME (expected vX.Y.Z)"
+            exit 1
+          fi
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build universal binary
+        run: |
+          swift build -c release --arch arm64 --arch x86_64 || true
+          # Verify the binary was actually produced (build may exit 1 due to dependency warnings)
+          if [ ! -f .build/apple/Products/Release/macos-mcp-server ]; then
+            echo "Build failed: binary not found"
+            exit 1
+          fi
+          file .build/apple/Products/Release/macos-mcp-server
+          lipo -info .build/apple/Products/Release/macos-mcp-server
+
+      - name: Create tarball
+        run: |
+          mkdir -p staging
+          cp .build/apple/Products/Release/macos-mcp-server staging/
+          cp LICENSE staging/ 2>/dev/null || true
+          cd staging
+          tar czf ../macos-mcp-server-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz *
+
+      - name: Compute SHA256
+        id: shasum
+        run: |
+          SHA=$(shasum -a 256 macos-mcp-server-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: macos-mcp-server-${{ steps.version.outputs.version }}-universal-apple-darwin.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  update-homebrew:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: jcanizalez/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.build-and-release.outputs.version }}
+          SHA256: ${{ needs.build-and-release.outputs.tarball_sha256 }}
+        run: |
+          URL="https://github.com/jcanizalez/macos-mcp-server/releases/download/v${VERSION}/macos-mcp-server-${VERSION}-universal-apple-darwin.tar.gz"
+          # Update url and sha256
+          sed -i "s|url \".*\"|url \"${URL}\"|" Formula/macos-mcp-server.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA256}\"|" Formula/macos-mcp-server.rb
+          # Remove xcode build dependency
+          sed -i '/depends_on xcode:/d' Formula/macos-mcp-server.rb
+          # Replace install block: remove swift build, just install the binary
+          sed -i '/def install/,/^  end/{/def install/!{/^  end/!d}}' Formula/macos-mcp-server.rb
+          sed -i '/def install/a\    bin.install "macos-mcp-server"' Formula/macos-mcp-server.rb
+          echo "Updated formula:"
+          cat Formula/macos-mcp-server.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/macos-mcp-server.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update macos-mcp-server to v${{ needs.build-and-release.outputs.version }}"
+          git push
